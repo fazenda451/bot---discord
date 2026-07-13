@@ -52,12 +52,22 @@ def save_config(data: dict):
 # ═══════════════════════════════════════════════
 #  HELPER — POSTAR HORÁRIO
 # ═══════════════════════════════════════════════
-async def post_schedule(channel: discord.TextChannel, activity: str, hours: list[int]):
+async def post_schedule(
+    channel: discord.TextChannel,
+    hours: list[int],
+    role: discord.Role | None = None,
+    activity: str = "",
+):
     tz  = pytz.timezone(TIMEZONE)
     now = datetime.now(tz)
+    date_str = now.strftime("%d/%m")
 
+    # Título do embed: se tiver atividade usa a atividade, senão usa a data
+    title_str = f"🎮  {activity.upper()}" if activity else f"🗓️  {date_str}"
+
+    # ── Embed de cabeçalho ──────────
     embed = discord.Embed(
-        title=f"🎮  {activity.upper()}",
+        title=title_str,
         description=(
             "Reage em cada hora com a tua disponibilidade:\n\n"
             "✅ **Presente**\n"
@@ -70,6 +80,7 @@ async def post_schedule(channel: discord.TextChannel, activity: str, hours: list
     embed.set_footer(text=f"Horário • {now.strftime('%d/%m/%Y')}")
     await channel.send(embed=embed)
 
+    # ── Uma mensagem por hora com reações ──────
     for h in hours:
         msg = await channel.send(f"🕐  **{h}H**")
         for emoji in REACTIONS:
@@ -79,6 +90,10 @@ async def post_schedule(channel: discord.TextChannel, activity: str, hours: list
                 pass
             await asyncio.sleep(0.5)
 
+    # ── Mensagem final de votos ─────────────────
+    mention = role.mention if role else ""
+    await channel.send(f"VOTEM FILHOS DA PUTA {mention}".strip())
+
 
 # ═══════════════════════════════════════════════
 #  SLASH COMMANDS
@@ -87,12 +102,13 @@ async def post_schedule(channel: discord.TextChannel, activity: str, hours: list
 # ── /horario ────────────────────────────────────
 @bot.tree.command(
     name="horario",
-    description="Posta um horário de atividade com reações por hora",
+    description="Posta o horário do dia com reações por hora",
 )
 @app_commands.describe(
-    atividade="Nome da atividade  (ex: FARMAR LIXO)",
+    atividade="Nome da atividade (ex: FARMAR LIXO)",
     hora_inicio="Hora de início  (ex: 16) — opcional, padrão: próxima hora",
-    hora_fim="Hora de fim  (ex: 20) — opcional, padrão: início + 4",
+    hora_fim="Hora de fim  (ex: 23) — opcional, padrão: início + 4",
+    cargo="Cargo a mencionar no final",
 )
 @app_commands.default_permissions(manage_messages=True)
 async def slash_horario(
@@ -100,6 +116,7 @@ async def slash_horario(
     atividade: str,
     hora_inicio: int = -1,
     hora_fim: int = -1,
+    cargo: discord.Role | None = None,
 ):
     await interaction.response.defer(ephemeral=True)
 
@@ -122,15 +139,100 @@ async def slash_horario(
         return
 
     hours_list = list(range(hora_inicio, hora_fim + 1))
-    await post_schedule(interaction.channel, atividade, hours_list)
+    await post_schedule(interaction.channel, hours_list, cargo, atividade)
 
     await interaction.followup.send(
         embed=discord.Embed(
-            description=f"✅ Horário **{atividade}** postado! ({hora_inicio}H → {hora_fim}H)",
+            description=f"✅ Horário postado! ({hora_inicio}H → {hora_fim}H)",
             color=COLOR_GREEN,
         ),
         ephemeral=True,
     )
+
+
+# ── /participacao ────────────────────────────────
+@bot.tree.command(
+    name="participacao",
+    description="Inicia uma verificação de participação para uma atividade de 15 minutos",
+)
+@app_commands.describe(
+    atividade="Nome da atividade (ex: Treino, Reunião)",
+)
+@app_commands.default_permissions(manage_messages=True)
+async def slash_participacao(
+    interaction: discord.Interaction,
+    atividade: str,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    # Embed Inicial de Participação Aberta
+    embed = discord.Embed(
+        title=f"📝 Participação: {atividade.upper()}",
+        description="Reage com ✅ para confirmares a tua presença nesta atividade!\n\n⏳ **Tempo restante:** 15 minutos",
+        color=COLOR_BLUE,
+    )
+    embed.set_footer(text="A participação fecha automaticamente em 15 minutos.")
+    
+    # Envia a mensagem no canal público
+    channel = interaction.channel
+    msg = await channel.send(embed=embed)
+    await msg.add_reaction("✅")
+
+    # Confirmação efêmera para quem iniciou o comando
+    await interaction.followup.send(
+        embed=discord.Embed(
+            description=f"✅ Participação para **{atividade}** iniciada no canal!",
+            color=COLOR_GREEN,
+        ),
+        ephemeral=True,
+    )
+
+    # Função em segundo plano para contar os 15 minutos
+    async def fechar_participacao_apos_tempo():
+        await asyncio.sleep(900)  # 15 minutos em segundos (15 * 60)
+        
+        try:
+            # Puxa a mensagem atualizada para ler as reações
+            updated_msg = await channel.fetch_message(msg.id)
+            
+            # Encontra a reação ✅ e os utilizadores correspondentes
+            react = discord.utils.get(updated_msg.reactions, emoji="✅")
+            users = []
+            if react:
+                async for user in react.users():
+                    if not user.bot:
+                        users.append(user)
+            
+            # Edita o Embed para fechar a participação
+            embed_fechado = discord.Embed(
+                title=f"📝 Participação: {atividade.upper()} [FECHADA]",
+                description=f"A janela de participação para esta atividade terminou.",
+                color=COLOR_RED,
+            )
+            embed_fechado.set_footer(text="Participação encerrada.")
+            await updated_msg.edit(embed=embed_fechado)
+            
+            # Tenta limpar as reações para ninguém mais poder clicar
+            try:
+                await updated_msg.clear_reactions()
+            except discord.Forbidden:
+                pass
+            
+            # Cria a mensagem final de resumo (não-apagável)
+            if users:
+                nomes = ", ".join(f"{u.mention}" for u in users)
+                mensagem_resumo = f"📋 **Resumo da Atividade ({atividade}):**\nOs seguintes membros participaram:\n{nomes}"
+            else:
+                mensagem_resumo = f"📋 **Resumo da Atividade ({atividade}):**\nNinguém confirmou a presença a tempo."
+                
+            await channel.send(mensagem_resumo)
+            
+        except discord.NotFound:
+            # Se a mensagem foi excluída antes do fim do tempo
+            print(f"Mensagem de participação {msg.id} não foi encontrada para encerramento.")
+            
+    # Executa a tarefa de contagem em segundo plano sem bloquear o bot
+    asyncio.create_task(fechar_participacao_apos_tempo())
 
 
 # ── /editar ─────────────────────────────────────
@@ -170,7 +272,6 @@ async def slash_editar(
         )
         return
 
-    # Encontra mensagens de hora no canal
     hour_msgs: dict[int, discord.Message] = {}
     async for msg in interaction.channel.history(limit=60):
         if msg.author == bot.user and "🕐" in msg.content:
@@ -181,7 +282,6 @@ async def slash_editar(
 
     removed, added = [], []
 
-    # Remove horas
     for h in horas_rem:
         if h in hour_msgs:
             try:
@@ -190,7 +290,6 @@ async def slash_editar(
             except discord.Forbidden:
                 pass
 
-    # Adiciona horas
     for h in sorted(horas_add):
         if h not in hour_msgs:
             msg = await interaction.channel.send(f"🕐  **{h}H**")
@@ -229,7 +328,6 @@ async def slash_editar(
 async def slash_resumo(interaction: discord.Interaction):
     await interaction.response.defer()
 
-    # Encontra mensagens de hora no canal (mais antigas primeiro)
     hour_msgs: list[discord.Message] = []
     async for msg in interaction.channel.history(limit=60):
         if msg.author == bot.user and "🕐" in msg.content:
@@ -247,7 +345,7 @@ async def slash_resumo(interaction: discord.Interaction):
         )
         return
 
-    hour_msgs.reverse()  # mais antiga primeiro
+    hour_msgs.reverse()
 
     tz  = pytz.timezone(TIMEZONE)
     now = datetime.now(tz)
@@ -283,23 +381,21 @@ async def slash_resumo(interaction: discord.Interaction):
 # ── /auto ────────────────────────────────────────
 @bot.tree.command(
     name="auto",
-    description="Adiciona um agendamento automático diário",
+    description="Configura o envio automático diário do horário",
 )
 @app_commands.describe(
-    id="ID único para este agendamento  (ex: farm, raid, boss)",
-    atividade="Nome da atividade  (ex: FARMAR LIXO)",
-    hora_inicio="Primeira hora do horário  (ex: 16)",
-    hora_fim="Última hora do horário  (ex: 20)",
-    hora_post="Hora a que o bot publica a mensagem  (ex: 15)",
+    hora_inicio="Primeira hora do horário  (ex: 14)",
+    hora_fim="Última hora do horário  (ex: 23)",
+    hora_post="Hora a que o bot publica a mensagem  (ex: 13)",
+    cargo="Cargo a mencionar no final",
 )
 @app_commands.default_permissions(administrator=True)
 async def slash_auto(
     interaction: discord.Interaction,
-    id: str,
-    atividade: str,
     hora_inicio: int,
     hora_fim: int,
     hora_post: int,
+    cargo: discord.Role | None = None,
 ):
     if not (0 <= hora_inicio <= 23 and 0 <= hora_fim <= 23 and 0 <= hora_post <= 23):
         await interaction.response.send_message(
@@ -316,107 +412,81 @@ async def slash_auto(
         return
 
     cfg = load_config()
-    schedules: list = cfg.get("auto_schedules", [])
-
-    # Remove agendamento com mesmo ID se existir
-    schedules = [s for s in schedules if s["id"] != id]
-    schedules.append({
-        "id": id,
+    cfg["auto_schedule"] = {
         "channel_id": interaction.channel_id,
-        "activity": atividade,
         "hours": list(range(hora_inicio, hora_fim + 1)),
         "post_hour": hora_post,
-    })
-
-    cfg["auto_schedules"] = schedules
+        "role_id": cargo.id if cargo else None,
+    }
     save_config(cfg)
-    bot._auto_schedules = schedules
+    bot._auto_schedule = cfg["auto_schedule"]
 
     horas_str = " · ".join(f"{h}H" for h in range(hora_inicio, hora_fim + 1))
 
     embed = discord.Embed(
-        title="⏰  Agendamento Adicionado",
+        title="⏰  Agendamento Automático Ativado",
         color=COLOR_GREEN,
     )
-    embed.add_field(name="🆔 ID",         value=f"`{id}`",                 inline=True)
-    embed.add_field(name="📌 Atividade",  value=f"**{atividade}**",        inline=True)
-    embed.add_field(name="⏱️ Publica às", value=f"**{hora_post}H**",       inline=True)
-    embed.add_field(name="🕐 Horários",   value=horas_str,                 inline=False)
-    embed.add_field(name="📢 Canal",      value=interaction.channel.mention, inline=False)
-    embed.set_footer(text=f"Total de agendamentos: {len(schedules)} • Usa /parar id:{id} para cancelar")
+    embed.add_field(name="⏱️ Publica às", value=f"**{hora_post}H todos os dias**", inline=True)
+    embed.add_field(name="📢 Canal",      value=interaction.channel.mention,        inline=True)
+    if cargo:
+        embed.add_field(name="📣 Cargo", value=cargo.mention, inline=True)
+    embed.add_field(name="🕐 Horários",  value=horas_str, inline=False)
+    embed.set_footer(text="Usa /parar para cancelar o agendamento.")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ── /parar ───────────────────────────────────────
-@bot.tree.command(name="parar", description="Para um ou todos os agendamentos automáticos")
-@app_commands.describe(id="ID do agendamento a parar — deixa vazio para parar TODOS")
+@bot.tree.command(name="parar", description="Para o agendamento automático")
 @app_commands.default_permissions(administrator=True)
-async def slash_parar(interaction: discord.Interaction, id: str = ""):
+async def slash_parar(interaction: discord.Interaction):
     cfg = load_config()
-    schedules: list = cfg.get("auto_schedules", [])
-
-    if not schedules:
+    if "auto_schedule" not in cfg:
         await interaction.response.send_message(
-            embed=discord.Embed(description="ℹ️ Não há agendamentos ativos.", color=COLOR_YELLOW),
+            embed=discord.Embed(description="ℹ️ Não há nenhum agendamento ativo.", color=COLOR_YELLOW),
             ephemeral=True,
         )
         return
 
-    if id:
-        novos = [s for s in schedules if s["id"] != id]
-        removidos = len(schedules) - len(novos)
-        msg = f"🛑 Agendamento `{id}` parado." if removidos else f"❌ Não encontrei nenhum agendamento com ID `{id}`."
-        cor = COLOR_RED if removidos else COLOR_YELLOW
-    else:
-        novos = []
-        removidos = len(schedules)
-        msg = f"🛑 Todos os {removidos} agendamentos foram parados."
-        cor = COLOR_RED
-
-    cfg["auto_schedules"] = novos
+    cfg.pop("auto_schedule", None)
     save_config(cfg)
-    bot._auto_schedules = novos
+    bot._auto_schedule = None
 
     await interaction.response.send_message(
-        embed=discord.Embed(description=msg, color=cor),
+        embed=discord.Embed(description="🛑 Agendamento automático parado.", color=COLOR_RED),
         ephemeral=True,
     )
 
 
 # ── /status ──────────────────────────────────────
-@bot.tree.command(name="status", description="Mostra todos os agendamentos automáticos ativos")
+@bot.tree.command(name="status", description="Mostra o estado do agendamento automático")
 @app_commands.default_permissions(manage_messages=True)
 async def slash_status(interaction: discord.Interaction):
     cfg = load_config()
-    schedules: list = cfg.get("auto_schedules", [])
+    sch = cfg.get("auto_schedule")
 
     tz  = pytz.timezone(TIMEZONE)
     now = datetime.now(tz)
 
-    if not schedules:
+    if not sch:
         embed = discord.Embed(
             title="📊  Estado do Bot",
             description="Nenhum agendamento automático configurado.\nUsa `/auto` para criar um!",
             color=COLOR_YELLOW,
         )
     else:
-        embed = discord.Embed(
-            title=f"📊  Agendamentos Ativos ({len(schedules)})",
-            color=COLOR_GREEN,
-        )
-        for s in schedules:
-            channel = bot.get_channel(s["channel_id"])
-            horas_str = " · ".join(f"{h}H" for h in s["hours"])
-            embed.add_field(
-                name=f"🎮 {s['activity']}  •  ID: `{s['id']}`",
-                value=(
-                    f"📢 Canal: {channel.mention if channel else '?'}\n"
-                    f"🕐 Horários: {horas_str}\n"
-                    f"⏱️ Publica às: **{s['post_hour']}H**"
-                ),
-                inline=False,
-            )
+        channel = bot.get_channel(sch["channel_id"])
+        horas_str = " · ".join(f"{h}H" for h in sch["hours"])
+        embed = discord.Embed(title="📊  Estado do Bot", color=COLOR_GREEN)
+        embed.add_field(name="✅ Estado",     value="**Ativo**",                          inline=True)
+        embed.add_field(name="⏱️ Publica às", value=f"**{sch['post_hour']}H**",           inline=True)
+        embed.add_field(name="📢 Canal",      value=channel.mention if channel else "?",  inline=True)
+        embed.add_field(name="🕐 Horários",   value=horas_str,                            inline=False)
+        if sch.get("role_id"):
+            role = interaction.guild.get_role(sch["role_id"])
+            if role:
+                embed.add_field(name="📣 Cargo", value=role.mention, inline=True)
 
     embed.set_footer(text=f"Agora: {now.strftime('%H:%M')} • {TIMEZONE}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -449,7 +519,12 @@ async def slash_ajuda(interaction: discord.Interaction):
     )
     embed.add_field(
         name="</horario>",
-        value="Posta um horário.\n`atividade` `hora_inicio` `hora_fim`",
+        value="Posta o horário do dia.\n`hora_inicio` `hora_fim` `cargo` *(opcional)*",
+        inline=False,
+    )
+    embed.add_field(
+        name="</participacao>",
+        value="Inicia uma verificação de presença de 15 minutos.\n`atividade` → nome da atividade",
         inline=False,
     )
     embed.add_field(
@@ -464,24 +539,12 @@ async def slash_ajuda(interaction: discord.Interaction):
     )
     embed.add_field(
         name="</auto>",
-        value="Adiciona agendamento automático diário.\n`id` `atividade` `hora_inicio` `hora_fim` `hora_post`",
+        value="Configura agendamento automático diário.\n`hora_inicio` `hora_fim` `hora_post` `cargo` *(opcional)*",
         inline=False,
     )
-    embed.add_field(
-        name="</parar>",
-        value="Para um agendamento pelo `id`, ou todos se não deres ID.",
-        inline=False,
-    )
-    embed.add_field(
-        name="</status>",
-        value="Mostra todos os agendamentos ativos.",
-        inline=False,
-    )
-    embed.add_field(
-        name="</limpar>",
-        value="Apaga mensagens do canal.",
-        inline=False,
-    )
+    embed.add_field(name="</parar>",  value="Para o agendamento automático.",  inline=False)
+    embed.add_field(name="</status>", value="Mostra o estado do agendamento.", inline=False)
+    embed.add_field(name="</limpar>", value="Apaga mensagens do canal.",        inline=False)
     embed.add_field(
         name="🎭 Reações",
         value="✅ Presente • ❌ Não estou • 🕟 Demoro 15min",
@@ -519,22 +582,24 @@ async def prefix_sync(ctx):
 
 
 # ═══════════════════════════════════════════════
-#  TASK — AUTO SCHEDULE (suporta múltiplos)
+#  TASK — AUTO SCHEDULE
 # ═══════════════════════════════════════════════
 @tasks.loop(minutes=1)
 async def check_auto_schedule():
-    schedules: list = getattr(bot, "_auto_schedules", [])
-    if not schedules:
+    sch = getattr(bot, "_auto_schedule", None)
+    if not sch:
         return
 
     tz  = pytz.timezone(TIMEZONE)
     now = datetime.now(tz)
 
-    for s in schedules:
-        if now.hour == s["post_hour"] and now.minute == 0:
-            channel = bot.get_channel(s["channel_id"])
-            if channel:
-                await post_schedule(channel, s["activity"], s["hours"])
+    if now.hour == sch["post_hour"] and now.minute == 0:
+        channel = bot.get_channel(sch["channel_id"])
+        if channel:
+            role_id = sch.get("role_id")
+            role = channel.guild.get_role(role_id) if role_id else None
+            # No auto, não passa atividade para usar a data do dia como título
+            await post_schedule(channel, sch["hours"], role)
 
 
 # ═══════════════════════════════════════════════
@@ -543,15 +608,7 @@ async def check_auto_schedule():
 @bot.event
 async def on_ready():
     cfg = load_config()
-
-    # Migração: suporte ao formato antigo (auto_schedule singular)
-    if "auto_schedule" in cfg and "auto_schedules" not in cfg:
-        old = cfg.pop("auto_schedule")
-        old["id"] = "principal"
-        cfg["auto_schedules"] = [old]
-        save_config(cfg)
-
-    bot._auto_schedules = cfg.get("auto_schedules", [])
+    bot._auto_schedule = cfg.get("auto_schedule", None)
 
     # Sync global
     try:
@@ -563,7 +620,7 @@ async def on_ready():
     check_auto_schedule.start()
     print(f"[OK] Bot online: {bot.user} (ID: {bot.user.id})")
     print(f"[TZ] Fuso horario: {TIMEZONE}")
-    print(f"[SCH] {len(bot._auto_schedules)} agendamento(s) carregado(s)")
+    print(f"[SCH] Agendamento: {'Ativo' if bot._auto_schedule else 'Inativo'}")
     print("-" * 40)
 
 
