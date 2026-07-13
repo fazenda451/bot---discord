@@ -1,5 +1,8 @@
-# Ficheiros a ignorar pelo Git
+# Ficheiros sensíveis — NUNCA enviar para o GitHub
 .env
+schedule_config.json
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
