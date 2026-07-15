@@ -95,7 +95,7 @@ O bot guarda cópias do `schedule_config.json` para evitar perda de dados:
 | `/participacao` | Inicia verificação de presença (padrão: 15 min) | **Todos** |
 | `/add` | Adiciona membro à participação depois de fechada | Gerir Mensagens |
 | `/ranking` | Ranking de quem mais participou no mês | Todos |
-| `/presenca` | Quantas vezes um membro participou num mês | Todos |
+| `/presenca` | Quantas vezes um membro participou num mês | Gerir Mensagens |
 | `/editar` | Adiciona ou remove horas de um horário existente | Gerir Mensagens |
 | `/resumo` | Mostra quem reagiu em cada hora | Gerir Mensagens |
 | `/auto` | Configura envio automático diário do horário | Administrador |

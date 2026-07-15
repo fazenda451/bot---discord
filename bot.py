@@ -715,6 +715,7 @@ async def slash_ranking(
     mes="Mês (1-12, opcional — padrão: mês atual)",
     ano="Ano (opcional — padrão: ano atual)",
 )
+@app_commands.default_permissions(manage_messages=True)
 async def slash_presenca(
     interaction: discord.Interaction,
     membro: discord.Member | None = None,
@@ -1085,7 +1086,7 @@ async def slash_ajuda(interaction: discord.Interaction):
     )
     embed.add_field(
         name="</presenca>",
-        value="Presenças de um membro num mês.\n`membro` `mes` `ano` *(opcional)*",
+        value="Presenças de um membro num mês *(Gerir Mensagens)*.\n`membro` `mes` `ano` *(opcional)*",
         inline=False,
     )
     embed.add_field(
