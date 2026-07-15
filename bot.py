@@ -5,7 +5,9 @@ import os
 import asyncio
 import json
 import re
-from datetime import datetime
+import shutil
+import time
+from datetime import datetime, timedelta
 import pytz
 from dotenv import load_dotenv
 
@@ -17,8 +19,20 @@ load_dotenv()
 TOKEN    = os.getenv("DISCORD_TOKEN")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Lisbon")
 CONFIG_FILE = "schedule_config.json"
+BACKUP_DIR = "config_backups"
+LATEST_BACKUP_FILE = "schedule_config.latest.bak"
+MAX_BACKUPS = 50
+BACKUP_MIN_INTERVAL = 1800
 
 REACTIONS = ["✅", "❌", "🕟"]
+
+MONTHS_PT = [
+    "",
+    "janeiro", "fevereiro", "março", "abril", "maio", "junho",
+    "julho", "agosto", "setembro", "outubro", "novembro", "dezembro",
+]
+
+_backup_last_at = 0.0
 
 COLOR_BLUE   = 0x5865F2
 COLOR_GREEN  = 0x57F287
@@ -37,7 +51,92 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ═══════════════════════════════════════════════
 #  PERSISTÊNCIA (JSON)
 # ═══════════════════════════════════════════════
+def is_config_usable() -> bool:
+    if not os.path.exists(CONFIG_FILE):
+        return False
+    try:
+        if os.path.getsize(CONFIG_FILE) == 0:
+            return False
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            json.load(f)
+        return True
+    except (json.JSONDecodeError, OSError):
+        return False
+
+
+def restore_config_from_backup() -> bool:
+    if os.path.exists(LATEST_BACKUP_FILE):
+        try:
+            with open(LATEST_BACKUP_FILE, "r", encoding="utf-8") as f:
+                json.load(f)
+            shutil.copy2(LATEST_BACKUP_FILE, CONFIG_FILE)
+            print(f"[BAK] Config restaurado de {LATEST_BACKUP_FILE}")
+            return True
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if not os.path.isdir(BACKUP_DIR):
+        return False
+
+    backups = sorted(
+        (f for f in os.listdir(BACKUP_DIR) if f.endswith(".json")),
+        reverse=True,
+    )
+    for name in backups:
+        path = os.path.join(BACKUP_DIR, name)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                json.load(f)
+            shutil.copy2(path, CONFIG_FILE)
+            print(f"[BAK] Config restaurado de {path}")
+            return True
+        except (json.JSONDecodeError, OSError):
+            continue
+    return False
+
+
+def ensure_config_available():
+    if is_config_usable():
+        return
+    restore_config_from_backup()
+
+
+def update_latest_backup():
+    if os.path.exists(CONFIG_FILE) and is_config_usable():
+        shutil.copy2(CONFIG_FILE, LATEST_BACKUP_FILE)
+
+
+def create_timestamped_backup(force: bool = False):
+    global _backup_last_at
+    if not is_config_usable():
+        return
+
+    now_ts = time.time()
+    if not force and now_ts - _backup_last_at < BACKUP_MIN_INTERVAL:
+        return
+
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    tz = pytz.timezone(TIMEZONE)
+    stamp = datetime.now(tz).strftime("%Y%m%d_%H%M%S")
+    dest = os.path.join(BACKUP_DIR, f"schedule_config_{stamp}.json")
+    shutil.copy2(CONFIG_FILE, dest)
+    _backup_last_at = now_ts
+
+    backups = sorted(
+        (f for f in os.listdir(BACKUP_DIR) if f.endswith(".json")),
+        reverse=True,
+    )
+    for old in backups[MAX_BACKUPS:]:
+        try:
+            os.remove(os.path.join(BACKUP_DIR, old))
+        except OSError:
+            pass
+
+    print(f"[BAK] Backup criado: {dest}")
+
+
 def load_config() -> dict:
+    ensure_config_available()
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -47,6 +146,90 @@ def load_config() -> dict:
 def save_config(data: dict):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+    update_latest_backup()
+    create_timestamped_backup()
+
+
+def get_tz_now() -> datetime:
+    return datetime.now(pytz.timezone(TIMEZONE))
+
+
+def get_guild_participation_history(cfg: dict, guild_id: int) -> list:
+    return cfg.get("participation_history", {}).get(str(guild_id), [])
+
+
+def record_participation_history(
+    cfg: dict,
+    guild_id: int,
+    channel_id: int,
+    atividade: str,
+    participants: list[int],
+    resumo_msg_id: int,
+    closed_at: float | None = None,
+):
+    if "participation_history" not in cfg:
+        cfg["participation_history"] = {}
+
+    key = str(guild_id)
+    history = cfg["participation_history"].get(key, [])
+
+    for entry in history:
+        if entry.get("resumo_msg_id") == resumo_msg_id:
+            entry["participants"] = participants
+            entry["atividade"] = atividade
+            cfg["participation_history"][key] = history
+            save_config(cfg)
+            return
+
+    history.insert(0, {
+        "resumo_msg_id": resumo_msg_id,
+        "channel_id": channel_id,
+        "atividade": atividade,
+        "closed_at": closed_at or time.time(),
+        "participants": participants,
+    })
+    cfg["participation_history"][key] = history[:500]
+    save_config(cfg)
+
+
+def filter_history_by_month(history: list, year: int, month: int) -> list:
+    tz = pytz.timezone(TIMEZONE)
+    filtered = []
+    for entry in history:
+        closed_at = entry.get("closed_at")
+        if not closed_at:
+            continue
+        dt = datetime.fromtimestamp(closed_at, tz=tz)
+        if dt.year == year and dt.month == month:
+            filtered.append(entry)
+    return filtered
+
+
+def count_participations_by_member(history: list) -> dict[int, int]:
+    counts: dict[int, int] = {}
+    for entry in history:
+        for uid in entry.get("participants", []):
+            counts[uid] = counts.get(uid, 0) + 1
+    return counts
+
+
+def resolve_month_year(mes: int, ano: int) -> tuple[int, int, str | None]:
+    now = get_tz_now()
+    year = ano if ano > 0 else now.year
+    month = mes if mes > 0 else now.month
+
+    if not 1 <= month <= 12:
+        return year, month, "❌ O mês deve estar entre 1 e 12."
+    if year < 2020 or year > now.year + 1:
+        return year, month, "❌ Ano inválido."
+    return year, month, None
+
+
+def format_member_display(guild: discord.Guild, user_id: int) -> str:
+    member = guild.get_member(user_id)
+    if member:
+        return member.mention
+    return f"<@{user_id}>"
 
 
 # ═══════════════════════════════════════════════
@@ -153,86 +336,449 @@ async def slash_horario(
 # ── /participacao ────────────────────────────────
 @bot.tree.command(
     name="participacao",
-    description="Inicia uma verificação de participação para uma atividade de 15 minutos",
+    description="Inicia uma verificação de presença para uma atividade",
 )
 @app_commands.describe(
     atividade="Nome da atividade (ex: Treino, Reunião)",
+    tempo="Tempo de duração em minutos (opcional, padrão: 15)",
 )
-@app_commands.default_permissions(manage_messages=True)
 async def slash_participacao(
     interaction: discord.Interaction,
     atividade: str,
+    tempo: int = 15,
 ):
     await interaction.response.defer(ephemeral=True)
 
+    if tempo <= 0:
+        await interaction.followup.send(
+            embed=discord.Embed(description="❌ O tempo deve ser maior que 0 minutos.", color=COLOR_RED),
+            ephemeral=True,
+        )
+        return
+
+    tz = pytz.timezone(TIMEZONE)
+    now = datetime.now(tz)
+    
     # Embed Inicial de Participação Aberta
     embed = discord.Embed(
         title=f"📝 Participação: {atividade.upper()}",
-        description="Reage com ✅ para confirmares a tua presença nesta atividade!\n\n⏳ **Tempo restante:** 15 minutos",
+        description=f"Reage com ✅ para confirmares a tua presença nesta atividade!\n\n⏳ **Tempo restante:** {tempo} minutos",
         color=COLOR_BLUE,
     )
-    embed.set_footer(text="A participação fecha automaticamente em 15 minutos.")
+    embed.set_footer(text=f"A participação fecha automaticamente às {(now + timedelta(minutes=tempo)).strftime('%H:%M')}.")
     
     # Envia a mensagem no canal público
     channel = interaction.channel
     msg = await channel.send(embed=embed)
     await msg.add_reaction("✅")
 
+    # Guardar informação da participação para resiliência a quedas do bot
+    end_timestamp = now.timestamp() + (tempo * 60)
+    cfg = load_config()
+    cfg["active_participation"] = {
+        "msg_id": msg.id,
+        "channel_id": channel.id,
+        "atividade": atividade,
+        "end_time": end_timestamp
+    }
+    save_config(cfg)
+
     # Confirmação efêmera para quem iniciou o comando
     await interaction.followup.send(
         embed=discord.Embed(
-            description=f"✅ Participação para **{atividade}** iniciada no canal!",
+            description=f"✅ Participação para **{atividade}** iniciada no canal por {tempo} minutos!",
             color=COLOR_GREEN,
         ),
         ephemeral=True,
     )
 
-    # Função em segundo plano para contar os 15 minutos
-    async def fechar_participacao_apos_tempo():
-        await asyncio.sleep(900)  # 15 minutos em segundos (15 * 60)
-        
+    # Agenda a finalização da participação
+    asyncio.create_task(fechar_participacao_task(msg.id, channel.id, atividade, end_timestamp))
+
+
+def format_resumo_participacao(atividade: str, users: list) -> str:
+    if users:
+        nomes_lista = "\n".join(
+            f"- {u.mention if hasattr(u, 'mention') else f'<@{u.id}>'}"
+            for u in users
+        )
+        return (
+            f"📋 **Resumo da Atividade ({atividade}):**\n"
+            f"Os seguintes membros participaram:\n{nomes_lista}"
+        )
+    return (
+        f"📋 **Resumo da Atividade ({atividade}):**\n"
+        f"Ninguém confirmou a presença a tempo."
+    )
+
+
+def get_closed_participations(cfg: dict, channel_id: int) -> list:
+    return cfg.get("closed_participations", {}).get(str(channel_id), [])
+
+
+def save_closed_participation(cfg: dict, channel_id: int, entry: dict):
+    if "closed_participations" not in cfg:
+        cfg["closed_participations"] = {}
+    key = str(channel_id)
+    entries = cfg["closed_participations"].get(key, [])
+    entries.insert(0, entry)
+    cfg["closed_participations"][key] = entries[:10]
+    save_config(cfg)
+
+
+def find_closed_participation(cfg: dict, channel_id: int, atividade: str | None = None) -> dict | None:
+    entries = get_closed_participations(cfg, channel_id)
+    if not entries:
+        return None
+    if atividade:
+        atividade_lower = atividade.lower()
+        for entry in entries:
+            if entry.get("atividade", "").lower() == atividade_lower:
+                return entry
+        return None
+    return entries[0]
+
+
+async def find_resumo_message(channel: discord.TextChannel, atividade: str | None = None) -> discord.Message | None:
+    async for msg in channel.history(limit=50):
+        if msg.author != bot.user or not msg.content.startswith("📋 **Resumo da Atividade"):
+            continue
+        if atividade:
+            match = re.search(r"Resumo da Atividade \((.+?)\):", msg.content)
+            if not match or match.group(1).lower() != atividade.lower():
+                continue
+        return msg
+    return None
+
+
+def parse_participant_ids_from_resumo(content: str) -> list[int]:
+    return [int(uid) for uid in re.findall(r"<@!?(\d+)>", content)]
+
+
+async def fechar_participacao_task(msg_id: int, channel_id: int, atividade: str, end_timestamp: float):
+    tz = pytz.timezone(TIMEZONE)
+    now = datetime.now(tz).timestamp()
+    wait_time = end_timestamp - now
+    
+    if wait_time > 0:
+        await asyncio.sleep(wait_time)
+
+    channel = bot.get_channel(channel_id)
+    if not channel:
         try:
-            # Puxa a mensagem atualizada para ler as reações
-            updated_msg = await channel.fetch_message(msg.id)
-            
-            # Encontra a reação ✅ e os utilizadores correspondentes
-            react = discord.utils.get(updated_msg.reactions, emoji="✅")
-            users = []
-            if react:
-                async for user in react.users():
-                    if not user.bot:
-                        users.append(user)
-            
-            # Edita o Embed para fechar a participação
-            embed_fechado = discord.Embed(
-                title=f"📝 Participação: {atividade.upper()} [FECHADA]",
-                description=f"A janela de participação para esta atividade terminou.",
-                color=COLOR_RED,
+            channel = await bot.fetch_channel(channel_id)
+        except Exception:
+            return
+
+    try:
+        # Puxa a mensagem atualizada para ler as reações
+        updated_msg = await channel.fetch_message(msg_id)
+        
+        # Encontra a reação ✅ e os utilizadores correspondentes
+        react = discord.utils.get(updated_msg.reactions, emoji="✅")
+        users = []
+        if react:
+            async for user in react.users():
+                if not user.bot:
+                    users.append(user)
+        
+        # Edita o Embed para fechar a participação
+        embed_fechado = discord.Embed(
+            title=f"📝 Participação: {atividade.upper()} [FECHADA]",
+            description="A janela de participação para esta atividade terminou.",
+            color=COLOR_RED,
+        )
+        embed_fechado.set_footer(text="Participação encerrada.")
+        await updated_msg.edit(embed=embed_fechado)
+        
+        # Tenta limpar as reações para ninguém mais poder clicar
+        try:
+            await updated_msg.clear_reactions()
+        except discord.Forbidden:
+            pass
+        
+        # Cria a mensagem final de resumo com lista (não-apagável)
+        resumo_msg = await channel.send(format_resumo_participacao(atividade, users))
+
+        cfg = load_config()
+        closed_at = datetime.now(tz).timestamp()
+        save_closed_participation(cfg, channel_id, {
+            "resumo_msg_id": resumo_msg.id,
+            "atividade": atividade,
+            "participants": [u.id for u in users],
+            "closed_at": closed_at,
+        })
+
+        if channel.guild:
+            record_participation_history(
+                cfg,
+                channel.guild.id,
+                channel_id,
+                atividade,
+                [u.id for u in users],
+                resumo_msg.id,
+                closed_at,
             )
-            embed_fechado.set_footer(text="Participação encerrada.")
-            await updated_msg.edit(embed=embed_fechado)
-            
-            # Tenta limpar as reações para ninguém mais poder clicar
-            try:
-                await updated_msg.clear_reactions()
-            except discord.Forbidden:
-                pass
-            
-            # Cria a mensagem final de resumo (não-apagável)
-            if users:
-                nomes = ", ".join(f"{u.mention}" for u in users)
-                mensagem_resumo = f"📋 **Resumo da Atividade ({atividade}):**\nOs seguintes membros participaram:\n{nomes}"
-            else:
-                mensagem_resumo = f"📋 **Resumo da Atividade ({atividade}):**\nNinguém confirmou a presença a tempo."
-                
-            await channel.send(mensagem_resumo)
-            
+        
+    except discord.NotFound:
+        print(f"Mensagem de participação {msg_id} não foi encontrada para encerramento.")
+    except Exception as e:
+        print(f"Erro ao fechar participação: {e}")
+    finally:
+        # Remove a participação ativa da persistência
+        cfg = load_config()
+        if "active_participation" in cfg and cfg["active_participation"].get("msg_id") == msg_id:
+            cfg.pop("active_participation", None)
+            save_config(cfg)
+
+
+# ── /add ─────────────────────────────────────────
+@bot.tree.command(
+    name="add",
+    description="Adiciona um membro à participação depois de fechada",
+)
+@app_commands.describe(
+    membro="Membro a adicionar à lista de participantes",
+    atividade="Nome da atividade (opcional, usa a mais recente se omitido)",
+)
+@app_commands.default_permissions(manage_messages=True)
+async def slash_add(
+    interaction: discord.Interaction,
+    membro: discord.Member,
+    atividade: str = "",
+):
+    await interaction.response.defer(ephemeral=True)
+
+    cfg = load_config()
+    channel = interaction.channel
+    atividade = atividade.strip()
+    closed = find_closed_participation(cfg, channel.id, atividade or None)
+
+    resumo_msg = None
+    atividade_nome = atividade
+
+    if closed:
+        atividade_nome = closed["atividade"]
+        try:
+            resumo_msg = await channel.fetch_message(closed["resumo_msg_id"])
         except discord.NotFound:
-            # Se a mensagem foi excluída antes do fim do tempo
-            print(f"Mensagem de participação {msg.id} não foi encontrada para encerramento.")
-            
-    # Executa a tarefa de contagem em segundo plano sem bloquear o bot
-    asyncio.create_task(fechar_participacao_apos_tempo())
+            closed = None
+
+    if not resumo_msg:
+        resumo_msg = await find_resumo_message(channel, atividade or None)
+        if not resumo_msg:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    description="❌ Nenhuma participação fechada encontrada neste canal.",
+                    color=COLOR_RED,
+                ),
+                ephemeral=True,
+            )
+            return
+
+        if not atividade_nome:
+            match = re.search(r"Resumo da Atividade \((.+?)\):", resumo_msg.content)
+            atividade_nome = match.group(1) if match else "Atividade"
+
+    if closed:
+        participant_ids = list(closed.get("participants", []))
+    else:
+        participant_ids = parse_participant_ids_from_resumo(resumo_msg.content)
+
+    if membro.id in participant_ids:
+        await interaction.followup.send(
+            embed=discord.Embed(
+                description=f"ℹ️ {membro.mention} já está na lista de participantes.",
+                color=COLOR_YELLOW,
+            ),
+            ephemeral=True,
+        )
+        return
+
+    participant_ids.append(membro.id)
+    guild = interaction.guild
+    users = []
+    for uid in participant_ids:
+        user = guild.get_member(uid) or interaction.client.get_user(uid)
+        if user:
+            users.append(user)
+        else:
+            users.append(discord.Object(id=uid))
+
+    await resumo_msg.edit(content=format_resumo_participacao(atividade_nome, users))
+
+    cfg = load_config()
+    entries = get_closed_participations(cfg, channel.id)
+    updated = False
+    for entry in entries:
+        if entry.get("resumo_msg_id") == resumo_msg.id:
+            entry["participants"] = participant_ids
+            updated = True
+            break
+    if not updated:
+        save_closed_participation(cfg, channel.id, {
+            "resumo_msg_id": resumo_msg.id,
+            "atividade": atividade_nome,
+            "participants": participant_ids,
+        })
+    else:
+        if "closed_participations" not in cfg:
+            cfg["closed_participations"] = {}
+        cfg["closed_participations"][str(channel.id)] = entries
+        save_config(cfg)
+
+    if interaction.guild:
+        record_participation_history(
+            load_config(),
+            interaction.guild.id,
+            channel.id,
+            atividade_nome,
+            participant_ids,
+            resumo_msg.id,
+        )
+
+    await interaction.followup.send(
+        embed=discord.Embed(
+            description=f"✅ {membro.mention} adicionado à participação **{atividade_nome}**.",
+            color=COLOR_GREEN,
+        ),
+        ephemeral=True,
+    )
+
+
+# ── /ranking ─────────────────────────────────────
+@bot.tree.command(
+    name="ranking",
+    description="Mostra quem mais participou nas atividades do mês",
+)
+@app_commands.describe(
+    mes="Mês (1-12, opcional — padrão: mês atual)",
+    ano="Ano (opcional — padrão: ano atual)",
+)
+async def slash_ranking(
+    interaction: discord.Interaction,
+    mes: int = 0,
+    ano: int = 0,
+):
+    await interaction.response.defer()
+
+    year, month, error = resolve_month_year(mes, ano)
+    if error:
+        await interaction.followup.send(
+            embed=discord.Embed(description=error, color=COLOR_RED),
+            ephemeral=True,
+        )
+        return
+
+    cfg = load_config()
+    history = filter_history_by_month(
+        get_guild_participation_history(cfg, interaction.guild.id),
+        year,
+        month,
+    )
+    counts = count_participations_by_member(history)
+
+    if not counts:
+        await interaction.followup.send(
+            embed=discord.Embed(
+                description=f"ℹ️ Sem participações registadas em **{MONTHS_PT[month]} de {year}**.",
+                color=COLOR_YELLOW,
+            ),
+            ephemeral=True,
+        )
+        return
+
+    ranking = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, (uid, count) in enumerate(ranking[:15]):
+        prefix = medals[i] if i < 3 else f"**{i + 1}.**"
+        lines.append(f"{prefix} {format_member_display(interaction.guild, uid)} — **{count}** participações")
+
+    embed = discord.Embed(
+        title=f"🏆 Ranking de Participação — {MONTHS_PT[month].capitalize()} {year}",
+        description="\n".join(lines),
+        color=COLOR_BLUE,
+        timestamp=get_tz_now(),
+    )
+    embed.set_footer(text=f"{len(history)} atividades registadas neste mês")
+    await interaction.followup.send(embed=embed)
+
+
+# ── /presenca ────────────────────────────────────
+@bot.tree.command(
+    name="presenca",
+    description="Mostra quantas vezes um membro participou num mês",
+)
+@app_commands.describe(
+    membro="Membro a consultar (opcional — padrão: tu)",
+    mes="Mês (1-12, opcional — padrão: mês atual)",
+    ano="Ano (opcional — padrão: ano atual)",
+)
+async def slash_presenca(
+    interaction: discord.Interaction,
+    membro: discord.Member | None = None,
+    mes: int = 0,
+    ano: int = 0,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    target = membro or interaction.user
+    year, month, error = resolve_month_year(mes, ano)
+    if error:
+        await interaction.followup.send(
+            embed=discord.Embed(description=error, color=COLOR_RED),
+            ephemeral=True,
+        )
+        return
+
+    cfg = load_config()
+    history = filter_history_by_month(
+        get_guild_participation_history(cfg, interaction.guild.id),
+        year,
+        month,
+    )
+
+    count = 0
+    atividades = []
+    for entry in history:
+        if target.id in entry.get("participants", []):
+            count += 1
+            atividades.append(entry.get("atividade", "Atividade"))
+
+    month_name = MONTHS_PT[month]
+    if count == 0:
+        description = (
+            f"{target.mention} não participou em nenhuma atividade "
+            f"em **{month_name} de {year}**."
+        )
+    elif count == 1:
+        description = (
+            f"{target.mention} participou **1 vez** em **{month_name} de {year}**."
+        )
+    else:
+        description = (
+            f"{target.mention} participou **{count} vezes** em **{month_name} de {year}**."
+        )
+
+    embed = discord.Embed(
+        title="📈 Presença do Membro",
+        description=description,
+        color=COLOR_GREEN if count else COLOR_YELLOW,
+        timestamp=get_tz_now(),
+    )
+
+    if atividades:
+        recent = atividades[:10]
+        embed.add_field(
+            name="Atividades",
+            value="\n".join(f"• {name}" for name in recent),
+            inline=False,
+        )
+        if len(atividades) > 10:
+            embed.set_footer(text=f"+ {len(atividades) - 10} atividades adicionais")
+
+    await interaction.followup.send(embed=embed)
 
 
 # ── /editar ─────────────────────────────────────
@@ -528,6 +1074,21 @@ async def slash_ajuda(interaction: discord.Interaction):
         inline=False,
     )
     embed.add_field(
+        name="</add>",
+        value="Adiciona um membro à participação depois de fechada.\n`membro` `atividade` *(opcional)*",
+        inline=False,
+    )
+    embed.add_field(
+        name="</ranking>",
+        value="Ranking de quem mais participou no mês.\n`mes` `ano` *(opcional)*",
+        inline=False,
+    )
+    embed.add_field(
+        name="</presenca>",
+        value="Presenças de um membro num mês.\n`membro` `mes` `ano` *(opcional)*",
+        inline=False,
+    )
+    embed.add_field(
         name="</editar>",
         value="Edita o horário já postado.\n`adicionar: 21 22` ou `remover: 16 17`",
         inline=False,
@@ -568,13 +1129,18 @@ async def prefix_limpar(ctx, quantidade: int = 50):
 @bot.command(name="sync")
 @commands.is_owner()
 async def prefix_sync(ctx):
-    """Forca ressincronizacao dos slash commands neste servidor."""
+    """Limpa comandos locais do servidor e atualiza os globais para evitar duplicações."""
     try:
-        bot.tree.copy_global_to(guild=ctx.guild)
-        synced = await bot.tree.sync(guild=ctx.guild)
-        await ctx.send(f"✅ {len(synced)} comandos sincronizados! Faz Ctrl+R no Discord.", delete_after=10)
+        # 1. Limpa os comandos locais deste servidor
+        bot.tree.clear_commands(guild=ctx.guild)
+        await bot.tree.sync(guild=ctx.guild)
+        
+        # 2. Sincroniza a árvore global
+        synced = await bot.tree.sync()
+        
+        await ctx.send(f"✅ Comandos locais limpos! {len(synced)} comandos globais ativos. Faz Ctrl+R no teu Discord.", delete_after=10)
     except Exception as e:
-        await ctx.send(f"Erro: {e}", delete_after=8)
+        await ctx.send(f"Erro ao sincronizar: {e}", delete_after=8)
     try:
         await ctx.message.delete()
     except discord.Forbidden:
@@ -602,13 +1168,33 @@ async def check_auto_schedule():
             await post_schedule(channel, sch["hours"], role)
 
 
+@tasks.loop(hours=6)
+async def scheduled_config_backup():
+    create_timestamped_backup(force=True)
+
+
 # ═══════════════════════════════════════════════
 #  EVENTOS
 # ═══════════════════════════════════════════════
 @bot.event
 async def on_ready():
+    ensure_config_available()
+    create_timestamped_backup(force=True)
+
     cfg = load_config()
     bot._auto_schedule = cfg.get("auto_schedule", None)
+
+    # Verifica se há alguma participação ativa pendente para retomar
+    active_part = cfg.get("active_participation")
+    if active_part:
+        msg_id = active_part["msg_id"]
+        channel_id = active_part["channel_id"]
+        atividade = active_part["atividade"]
+        end_time = active_part["end_time"]
+        
+        # Inicia a task em background
+        asyncio.create_task(fechar_participacao_task(msg_id, channel_id, atividade, end_time))
+        print(f"[SCH] Participacao ativa retomada para: {atividade}")
 
     # Sync global
     try:
@@ -618,6 +1204,8 @@ async def on_ready():
         print(f"[ERR] Erro ao sincronizar: {e}")
 
     check_auto_schedule.start()
+    if not scheduled_config_backup.is_running():
+        scheduled_config_backup.start()
     print(f"[OK] Bot online: {bot.user} (ID: {bot.user.id})")
     print(f"[TZ] Fuso horario: {TIMEZONE}")
     print(f"[SCH] Agendamento: {'Ativo' if bot._auto_schedule else 'Inativo'}")

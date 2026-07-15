@@ -1,6 +1,8 @@
 # Ficheiros sensíveis — NUNCA enviar para o GitHub
 .env
 schedule_config.json
+schedule_config.latest.bak
+config_backups/
 
 # Python
 __pycache__/
