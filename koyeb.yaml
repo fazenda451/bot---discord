@@ -1,0 +1,12 @@
+# Koyeb Config File for Bot Horarios
+version: "1.0"
+services:
+  - name: bot-horarios
+    type: worker
+    git:
+      repository: github.com/fazenda451/bot---discord
+      branch: main
+      build:
+        command: pip install -r requirements.txt
+      run:
+        command: python bot.py
