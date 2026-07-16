@@ -7,6 +7,7 @@ import json
 import re
 import shutil
 import time
+import unicodedata
 from datetime import datetime, timedelta
 import pytz
 from dotenv import load_dotenv
@@ -18,6 +19,11 @@ load_dotenv()
 # ═══════════════════════════════════════════════
 TOKEN    = os.getenv("DISCORD_TOKEN")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Lisbon")
+PENDENTES_CARGOS = [
+    c.strip()
+    for c in os.getenv("PENDENTES_CARGOS", "🚗︙Membro,[🔝] Promessa").split(",")
+    if c.strip()
+]
 CONFIG_FILE = "schedule_config.json"
 BACKUP_DIR = "config_backups"
 LATEST_BACKUP_FILE = "schedule_config.latest.bak"
@@ -25,6 +31,13 @@ MAX_BACKUPS = 50
 BACKUP_MIN_INTERVAL = 1800
 
 REACTIONS = ["✅", "❌", "🕟"]
+
+REACTION_FETCH_CONCURRENCY = 3
+EMBED_FIELD_MAX = 1024
+EMBED_MAX_FIELDS = 25
+EMBED_MAX_PER_MESSAGE = 10
+MAX_USERS_PER_REACTION = 50
+MAX_HOURS_TO_PROCESS = 20
 
 MONTHS_PT = [
     "",
@@ -44,6 +57,7 @@ COLOR_YELLOW = 0xFEE75C
 # ═══════════════════════════════════════════════
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -154,8 +168,78 @@ def get_tz_now() -> datetime:
     return datetime.now(pytz.timezone(TIMEZONE))
 
 
+def normalize_msg_id(msg_id) -> int:
+    return int(msg_id)
+
+
 def get_guild_participation_history(cfg: dict, guild_id: int) -> list:
     return cfg.get("participation_history", {}).get(str(guild_id), [])
+
+
+def update_participation_records(
+    cfg: dict,
+    guild_id: int,
+    channel_id: int,
+    atividade: str,
+    resumo_msg_id: int,
+    participant_ids: list[int],
+):
+    resumo_msg_id = normalize_msg_id(resumo_msg_id)
+
+    if "closed_participations" not in cfg:
+        cfg["closed_participations"] = {}
+    channel_key = str(channel_id)
+    closed_entries = cfg["closed_participations"].get(channel_key, [])
+    closed_updated = False
+    for entry in closed_entries:
+        if normalize_msg_id(entry.get("resumo_msg_id", 0)) == resumo_msg_id:
+            entry["participants"] = participant_ids
+            entry["atividade"] = atividade
+            closed_updated = True
+            break
+    if not closed_updated:
+        closed_entries.insert(0, {
+            "resumo_msg_id": resumo_msg_id,
+            "atividade": atividade,
+            "participants": participant_ids,
+        })
+    cfg["closed_participations"][channel_key] = closed_entries[:10]
+
+    if "participation_history" not in cfg:
+        cfg["participation_history"] = {}
+    guild_key = str(guild_id)
+    history = cfg["participation_history"].get(guild_key, [])
+    history_updated = False
+    for entry in history:
+        if normalize_msg_id(entry.get("resumo_msg_id", 0)) == resumo_msg_id:
+            entry["participants"] = participant_ids
+            entry["atividade"] = atividade
+            history_updated = True
+            break
+
+    if not history_updated:
+        atividade_lower = atividade.lower()
+        for entry in history:
+            if (
+                entry.get("channel_id") == channel_id
+                and entry.get("atividade", "").lower() == atividade_lower
+            ):
+                entry["participants"] = participant_ids
+                entry["resumo_msg_id"] = resumo_msg_id
+                history_updated = True
+                break
+
+    if not history_updated:
+        history.insert(0, {
+            "resumo_msg_id": resumo_msg_id,
+            "channel_id": channel_id,
+            "atividade": atividade,
+            "closed_at": time.time(),
+            "participants": participant_ids,
+        })
+
+    cfg["participation_history"][guild_key] = history[:500]
+    save_config(cfg)
 
 
 def record_participation_history(
@@ -167,6 +251,8 @@ def record_participation_history(
     resumo_msg_id: int,
     closed_at: float | None = None,
 ):
+    resumo_msg_id = normalize_msg_id(resumo_msg_id)
+
     if "participation_history" not in cfg:
         cfg["participation_history"] = {}
 
@@ -174,7 +260,7 @@ def record_participation_history(
     history = cfg["participation_history"].get(key, [])
 
     for entry in history:
-        if entry.get("resumo_msg_id") == resumo_msg_id:
+        if normalize_msg_id(entry.get("resumo_msg_id", 0)) == resumo_msg_id:
             entry["participants"] = participants
             entry["atividade"] = atividade
             cfg["participation_history"][key] = history
@@ -205,6 +291,19 @@ def filter_history_by_month(history: list, year: int, month: int) -> list:
     return filtered
 
 
+def filter_history_by_week(history: list, year: int, week_num: int) -> list:
+    tz = pytz.timezone(TIMEZONE)
+    filtered = []
+    for entry in history:
+        closed_at = entry.get("closed_at")
+        if not closed_at:
+            continue
+        dt = datetime.fromtimestamp(closed_at, tz=tz)
+        if dt.isocalendar()[0] == year and dt.isocalendar()[1] == week_num:
+            filtered.append(entry)
+    return filtered
+
+
 def count_participations_by_member(history: list) -> dict[int, int]:
     counts: dict[int, int] = {}
     for entry in history:
@@ -230,6 +329,256 @@ def format_member_display(guild: discord.Guild, user_id: int) -> str:
     if member:
         return member.mention
     return f"<@{user_id}>"
+
+
+def save_last_schedule(channel_id: int, hours: list[int], role_id: int | None):
+    cfg = load_config()
+    if "last_schedule" not in cfg:
+        cfg["last_schedule"] = {}
+    cfg["last_schedule"][str(channel_id)] = {
+        "role_id": role_id,
+        "hours": hours,
+        "posted_at": time.time(),
+    }
+    save_config(cfg)
+
+
+def normalize_role_name(name: str) -> str:
+    return unicodedata.normalize("NFC", name.strip()).casefold()
+
+
+def get_pendentes_roles(
+    guild: discord.Guild,
+    extra_roles: list[discord.Role] | None = None,
+) -> tuple[list[discord.Role], list[str]]:
+    if extra_roles:
+        return extra_roles, []
+
+    roles_by_name = {normalize_role_name(role.name): role for role in guild.roles}
+    found: list[discord.Role] = []
+    missing: list[str] = []
+    for entry in PENDENTES_CARGOS:
+        role = None
+        if entry.isdigit():
+            role = guild.get_role(int(entry))
+        else:
+            role = roles_by_name.get(normalize_role_name(entry))
+        if role:
+            found.append(role)
+        else:
+            missing.append(entry)
+    return found, missing
+
+
+def member_has_org_role(member: discord.Member, role_ids: set[int]) -> bool:
+    member_role_ids = getattr(member, "_roles", None)
+    if member_role_ids is None:
+        member_role_ids = {role.id for role in member.roles}
+    return bool(role_ids & member_role_ids)
+
+
+async def collect_org_members(
+    guild: discord.Guild,
+    roles: list[discord.Role],
+) -> list[discord.Member]:
+    role_ids = {role.id for role in roles}
+    seen: set[int] = set()
+    members: list[discord.Member] = []
+
+    # Try to use cached guild members first (fastest)
+    for member in guild.members:
+        if member.bot or member.id in seen:
+            continue
+        if member_has_org_role(member, role_ids):
+            seen.add(member.id)
+            members.append(member)
+
+    # If we found members in cache, return them
+    if members:
+        members.sort(key=lambda m: m.display_name.lower())
+        return members
+
+    # Fallback: chunk the guild (but with timeout protection)
+    try:
+        await asyncio.wait_for(guild.chunk(), timeout=5.0)
+    except (asyncio.TimeoutError, discord.HTTPException, discord.Forbidden):
+        pass
+
+    # Try again after chunking
+    for member in guild.members:
+        if member.bot or member.id in seen:
+            continue
+        if member_has_org_role(member, role_ids):
+            seen.add(member.id)
+            members.append(member)
+
+    members.sort(key=lambda m: m.display_name.lower())
+    return members
+
+
+async def find_schedule_hour_messages(channel: discord.TextChannel) -> list[discord.Message]:
+    hour_msgs: list[discord.Message] = []
+    async for msg in channel.history(limit=100):
+        if msg.author == bot.user and "🕐" in msg.content:
+            match = re.search(r"\*\*(\d+)H\*\*", msg.content)
+            if match:
+                hour_msgs.append(msg)
+        if len(hour_msgs) >= MAX_HOURS_TO_PROCESS:
+            break
+    hour_msgs.reverse()
+    return hour_msgs
+
+
+def truncate_text(text: str, max_len: int = EMBED_FIELD_MAX) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 4] + " ..."
+
+
+async def fetch_reaction_user_ids(
+    reaction: discord.Reaction,
+    sem: asyncio.Semaphore,
+) -> list[int]:
+    async with sem:
+        user_ids: list[int] = []
+        try:
+            async for user in reaction.users(limit=MAX_USERS_PER_REACTION):
+                if not user.bot:
+                    user_ids.append(user.id)
+        except (discord.HTTPException, discord.Forbidden):
+            pass
+        return user_ids
+
+
+async def collect_schedule_voters(hour_msgs: list[discord.Message]) -> set[int]:
+    voters: set[int] = set()
+    for msg in hour_msgs:
+        for reaction in msg.reactions:
+            if str(reaction.emoji) in REACTIONS:
+                try:
+                    async for user in reaction.users(limit=MAX_USERS_PER_REACTION):
+                        if not user.bot:
+                            voters.add(user.id)
+                except (discord.HTTPException, discord.Forbidden):
+                    pass
+    return voters
+
+
+def format_reaction_users_line(
+    emoji: str,
+    users: list[discord.User | discord.Member],
+    max_len: int = 980,
+) -> str:
+    parts: list[str] = []
+    used = len(emoji) + 1
+    for index, user in enumerate(users):
+        name = f"**{user.display_name}**"
+        sep = ", " if parts else ""
+        if used + len(sep) + len(name) > max_len:
+            remaining = len(users) - index
+            parts.append(f"... +{remaining} mais")
+            break
+        parts.append(name)
+        used += len(sep) + len(name)
+    return f"{emoji} {', '.join(parts)}"
+
+
+async def collect_hour_reaction_summary(
+    hour_msgs: list[discord.Message],
+) -> list[tuple[str, list[str]]]:
+    sem = asyncio.Semaphore(REACTION_FETCH_CONCURRENCY)
+
+    async def process_hour_msg(msg: discord.Message) -> tuple[str, list[str]]:
+        match = re.search(r"\*\*(\d+)H\*\*", msg.content)
+        hora = match.group(1) if match else "?"
+
+        async def fetch_users(reaction: discord.Reaction, emoji: str) -> tuple[str, list] | None:
+            async with sem:
+                users = []
+                try:
+                    async for user in reaction.users(limit=MAX_USERS_PER_REACTION):
+                        if not user.bot:
+                            users.append(user)
+                except (discord.HTTPException, discord.Forbidden):
+                    return None
+                if not users:
+                    return None
+                return emoji, users
+
+        tasks = [
+            fetch_users(reaction, str(reaction.emoji))
+            for reaction in msg.reactions
+            if str(reaction.emoji) in REACTIONS
+        ]
+        field_lines = []
+        if tasks:
+            try:
+                results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=15.0)
+                for result in results:
+                    if result is None:
+                        continue
+                    emoji, users = result
+                    field_lines.append(format_reaction_users_line(emoji, users))
+            except asyncio.TimeoutError:
+                field_lines.append("*⏱️ Timeout ao carregar reações*")
+        return hora, field_lines
+
+    try:
+        return await asyncio.wait_for(
+            asyncio.gather(*(process_hour_msg(msg) for msg in hour_msgs)),
+            timeout=30.0
+        )
+    except asyncio.TimeoutError:
+        return [("?", ["*⏱️ Timeout ao processar horários*])]
+
+
+def build_resumo_embeds(
+    hour_data: list[tuple[str, list[str]]],
+    now: datetime,
+) -> list[discord.Embed]:
+    embeds: list[discord.Embed] = []
+    current = discord.Embed(
+        title="📊  Resumo de Disponibilidade",
+        color=COLOR_BLUE,
+        timestamp=now,
+    )
+    field_count = 0
+
+    for hora, field_lines in hour_data:
+        value = "\n".join(field_lines) if field_lines else "*Sem reações ainda*"
+        value = truncate_text(value)
+
+        if field_count >= EMBED_MAX_FIELDS:
+            embeds.append(current)
+            current = discord.Embed(
+                title="📊  Resumo de Disponibilidade (cont.)",
+                color=COLOR_BLUE,
+                timestamp=now,
+            )
+            field_count = 0
+
+        current.add_field(name=f"🕐 {hora}H", value=value, inline=False)
+        field_count += 1
+
+    current.set_footer(text=f"Resumo gerado às {now.strftime('%H:%M')}")
+    embeds.append(current)
+    return embeds
+
+
+def chunk_mentions(mentions: list[str], max_len: int = 900) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+    for mention in mentions:
+        line = mention if not current else f"{current} {mention}"
+        if len(line) > max_len:
+            if current:
+                chunks.append(current)
+            current = mention
+        else:
+            current = line
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 # ═══════════════════════════════════════════════
@@ -276,6 +625,8 @@ async def post_schedule(
     # ── Mensagem final de votos ─────────────────
     mention = role.mention if role else ""
     await channel.send(f"VOTEM FILHOS DA PUTA {mention}".strip())
+
+    save_last_schedule(channel.id, hours, role.id if role else None)
 
 
 # ═══════════════════════════════════════════════
@@ -607,39 +958,113 @@ async def slash_add(
 
     await resumo_msg.edit(content=format_resumo_participacao(atividade_nome, users))
 
-    cfg = load_config()
-    entries = get_closed_participations(cfg, channel.id)
-    updated = False
-    for entry in entries:
-        if entry.get("resumo_msg_id") == resumo_msg.id:
-            entry["participants"] = participant_ids
-            updated = True
-            break
-    if not updated:
-        save_closed_participation(cfg, channel.id, {
-            "resumo_msg_id": resumo_msg.id,
-            "atividade": atividade_nome,
-            "participants": participant_ids,
-        })
-    else:
-        if "closed_participations" not in cfg:
-            cfg["closed_participations"] = {}
-        cfg["closed_participations"][str(channel.id)] = entries
-        save_config(cfg)
-
     if interaction.guild:
-        record_participation_history(
+        update_participation_records(
             load_config(),
             interaction.guild.id,
             channel.id,
             atividade_nome,
-            participant_ids,
             resumo_msg.id,
+            participant_ids,
         )
 
     await interaction.followup.send(
         embed=discord.Embed(
             description=f"✅ {membro.mention} adicionado à participação **{atividade_nome}**.",
+            color=COLOR_GREEN,
+        ),
+        ephemeral=True,
+    )
+
+
+# ── /remove ──────────────────────────────────────
+@bot.tree.command(
+    name="remove",
+    description="Remove um membro da participação depois de fechada",
+)
+@app_commands.describe(
+    membro="Membro a remover da lista de participantes",
+    atividade="Nome da atividade (opcional, usa a mais recente se omitido)",
+)
+@app_commands.default_permissions(manage_messages=True)
+async def slash_remove(
+    interaction: discord.Interaction,
+    membro: discord.Member,
+    atividade: str = "",
+):
+    await interaction.response.defer(ephemeral=True)
+
+    cfg = load_config()
+    channel = interaction.channel
+    atividade = atividade.strip()
+    closed = find_closed_participation(cfg, channel.id, atividade or None)
+
+    resumo_msg = None
+    atividade_nome = atividade
+
+    if closed:
+        atividade_nome = closed["atividade"]
+        try:
+            resumo_msg = await channel.fetch_message(closed["resumo_msg_id"])
+        except discord.NotFound:
+            closed = None
+
+    if not resumo_msg:
+        resumo_msg = await find_resumo_message(channel, atividade or None)
+        if not resumo_msg:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    description="❌ Nenhuma participação fechada encontrada neste canal.",
+                    color=COLOR_RED,
+                ),
+                ephemeral=True,
+            )
+            return
+
+        if not atividade_nome:
+            match = re.search(r"Resumo da Atividade \((.+?)\):", resumo_msg.content)
+            atividade_nome = match.group(1) if match else "Atividade"
+
+    if closed:
+        participant_ids = list(closed.get("participants", []))
+    else:
+        participant_ids = parse_participant_ids_from_resumo(resumo_msg.content)
+
+    if membro.id not in participant_ids:
+        await interaction.followup.send(
+            embed=discord.Embed(
+                description=f"ℹ️ {membro.mention} não está na lista de participantes.",
+                color=COLOR_YELLOW,
+            ),
+            ephemeral=True,
+        )
+        return
+
+    participant_ids.remove(membro.id)
+    guild = interaction.guild
+    users = []
+    for uid in participant_ids:
+        user = guild.get_member(uid) or interaction.client.get_user(uid)
+        if user:
+            users.append(user)
+        else:
+            users.append(discord.Object(id=uid))
+
+    await resumo_msg.edit(content=format_resumo_participacao(atividade_nome, users))
+
+    if interaction.guild:
+        update_participation_records(
+            load_config(),
+            interaction.guild.id,
+            channel.id,
+            atividade_nome,
+            resumo_msg.id,
+            participant_ids,
+        )
+
+    await interaction.followup.send(
+        embed=discord.Embed(
+            description=f"✅ {membro.mention} removido da participação **{atividade_nome}**.",
             color=COLOR_GREEN,
         ),
         ephemeral=True,
@@ -703,6 +1128,53 @@ async def slash_ranking(
     )
     embed.set_footer(text=f"{len(history)} atividades registadas neste mês")
     await interaction.followup.send(embed=embed)
+
+
+# ── /ranking_semanal ─────────────────────────────
+@bot.tree.command(
+    name="ranking_semanal",
+    description="Ativa o envio automático do ranking semanal (domingo 23:59)",
+)
+@app_commands.default_permissions(manage_messages=True)
+async def slash_ranking_semanal(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    cfg = load_config()
+    if "weekly_ranking" not in cfg:
+        cfg["weekly_ranking"] = {}
+
+    channel_key = str(interaction.channel.id)
+
+    # Toggle: se já existe, desativa; se não existe, ativa
+    if channel_key in cfg["weekly_ranking"]:
+        del cfg["weekly_ranking"][channel_key]
+        save_config(cfg)
+        await interaction.followup.send(
+            embed=discord.Embed(
+                description="✅ Ranking semanal desativado neste canal.",
+                color=COLOR_GREEN,
+            ),
+            ephemeral=True,
+        )
+        return
+
+    # Ativar automaticamente para domingo às 23:59
+    cfg["weekly_ranking"][channel_key] = {
+        "guild_id": interaction.guild.id,
+        "channel_id": interaction.channel.id,
+        "day_of_week": 6,  # Domingo
+        "hour": 23,  # 23:59
+        "enabled": True,
+    }
+    save_config(cfg)
+
+    await interaction.followup.send(
+        embed=discord.Embed(
+            description="✅ Ranking semanal ativado!\n\n📅 Será enviado automaticamente no **domingo às 23:59** neste canal.",
+            color=COLOR_GREEN,
+        ),
+        ephemeral=True,
+    )
 
 
 # ── /presenca ────────────────────────────────────
@@ -875,12 +1347,20 @@ async def slash_editar(
 async def slash_resumo(interaction: discord.Interaction):
     await interaction.response.defer()
 
-    hour_msgs: list[discord.Message] = []
-    async for msg in interaction.channel.history(limit=60):
-        if msg.author == bot.user and "🕐" in msg.content:
-            match = re.search(r"\*\*(\d+)H\*\*", msg.content)
-            if match:
-                hour_msgs.append(msg)
+    try:
+        hour_msgs = await asyncio.wait_for(
+            find_schedule_hour_messages(interaction.channel),
+            timeout=5.0
+        )
+    except asyncio.TimeoutError:
+        await interaction.followup.send(
+            embed=discord.Embed(
+                description="❌ Timeout ao procurar horários. Tenta novamente.",
+                color=COLOR_RED,
+            ),
+            ephemeral=True,
+        )
+        return
 
     if not hour_msgs:
         await interaction.followup.send(
@@ -892,37 +1372,150 @@ async def slash_resumo(interaction: discord.Interaction):
         )
         return
 
-    hour_msgs.reverse()
-
-    tz  = pytz.timezone(TIMEZONE)
+    tz = pytz.timezone(TIMEZONE)
     now = datetime.now(tz)
+    hour_data = await collect_hour_reaction_summary(hour_msgs)
+    embeds = build_resumo_embeds(hour_data, now)
 
-    embed = discord.Embed(
-        title="📊  Resumo de Disponibilidade",
-        color=COLOR_BLUE,
-        timestamp=now,
-    )
-
-    for msg in hour_msgs:
-        match = re.search(r"\*\*(\d+)H\*\*", msg.content)
-        hora = match.group(1) if match else "?"
-        field_lines = []
-
-        for reaction in msg.reactions:
-            if str(reaction.emoji) in REACTIONS:
-                users = [u async for u in reaction.users() if not u.bot]
-                if users:
-                    nomes = ", ".join(f"**{u.display_name}**" for u in users)
-                    field_lines.append(f"{reaction.emoji} {nomes}")
-
-        embed.add_field(
-            name=f"🕐 {hora}H",
-            value="\n".join(field_lines) if field_lines else "*Sem reações ainda*",
-            inline=False,
+    try:
+        for index in range(0, len(embeds), EMBED_MAX_PER_MESSAGE):
+            batch = embeds[index : index + EMBED_MAX_PER_MESSAGE]
+            if index == 0:
+                await interaction.followup.send(embeds=batch)
+            else:
+                await interaction.followup.send(embeds=batch)
+    except discord.HTTPException:
+        await interaction.followup.send(
+            embed=discord.Embed(
+                description="❌ O resumo é demasiado grande para enviar. Tenta reduzir horas ou pede a alguém com permissões para usar `/editar`.",
+                color=COLOR_RED,
+            ),
+            ephemeral=True,
         )
 
-    embed.set_footer(text=f"Resumo gerado às {now.strftime('%H:%M')}")
-    await interaction.followup.send(embed=embed)
+
+# ── /pendentes ───────────────────────────────────
+@bot.tree.command(
+    name="pendentes",
+    description="Mostra quem ainda não votou no horário (cargos da org)",
+)
+@app_commands.describe(
+    cargo="Cargo a verificar (opcional — usa PENDENTES_CARGOS se omitido)",
+)
+@app_commands.default_permissions(manage_messages=True)
+async def slash_pendentes(
+    interaction: discord.Interaction,
+    cargo: discord.Role | None = None,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        hour_msgs = await asyncio.wait_for(
+            find_schedule_hour_messages(interaction.channel),
+            timeout=5.0
+        )
+    except asyncio.TimeoutError:
+        await interaction.followup.send(
+            embed=discord.Embed(
+                description="❌ Timeout ao procurar horários. Tenta novamente.",
+                color=COLOR_RED,
+            ),
+            ephemeral=True,
+        )
+        return
+
+    if not hour_msgs:
+        await interaction.followup.send(
+            embed=discord.Embed(
+                description="❌ Nenhum horário encontrado neste canal.",
+                color=COLOR_YELLOW,
+            ),
+            ephemeral=True,
+        )
+        return
+
+    roles, missing = get_pendentes_roles(
+        interaction.guild,
+        [cargo] if cargo else None,
+    )
+    if missing:
+        await interaction.followup.send(
+            embed=discord.Embed(
+                description=(
+                    "❌ Cargos da org não encontrados no servidor:\n"
+                    + "\n".join(f"• `{name}`" for name in missing)
+                    + "\n\nConfigura `PENDENTES_CARGOS` no `.env`/Discloud com o nome exato ou ID do cargo."
+                ),
+                color=COLOR_RED,
+            ),
+            ephemeral=True,
+        )
+        return
+
+    try:
+        org_members, voters = await asyncio.wait_for(
+            asyncio.gather(
+                collect_org_members(interaction.guild, roles),
+                collect_schedule_voters(hour_msgs),
+            ),
+            timeout=15.0
+        )
+    except asyncio.TimeoutError:
+        await interaction.followup.send(
+            embed=discord.Embed(
+                description="❌ Timeout ao carregar membros ou votos. O servidor pode ter muitos membros.",
+                color=COLOR_RED,
+            ),
+            ephemeral=True,
+        )
+        return
+
+    non_voters = [m for m in org_members if m.id not in voters]
+
+    tz = pytz.timezone(TIMEZONE)
+    now = datetime.now(tz)
+    horas_list = []
+    for m in hour_msgs:
+        match = re.search(r"\*\*(\d+)H\*\*", m.content)
+        if match:
+            horas_list.append(f"{match.group(1)}H")
+    horas = truncate_text(", ".join(horas_list), 1024)
+
+    cargos_txt = " · ".join(role.mention for role in roles)
+    embed = discord.Embed(
+        title="⏳  Membros da org que ainda não votaram",
+        color=COLOR_YELLOW if non_voters else COLOR_GREEN,
+        timestamp=now,
+    )
+    embed.add_field(name="📣 Cargos", value=cargos_txt, inline=False)
+    embed.add_field(name="🕐 Horas", value=horas or "—", inline=True)
+    embed.add_field(name="👥 Membros da org", value=str(len(org_members)), inline=True)
+
+    if not org_members:
+        embed.description = (
+            "⚠️ Nenhum membro encontrado com os cargos indicados.\n"
+            "Confirma que o bot tem **Server Members Intent** ativo e que `PENDENTES_CARGOS` está correto."
+        )
+    elif not non_voters:
+        embed.description = (
+            f"✅ Todos os membros com cargo "
+            f"{' ou '.join(f'**{role.name}**' for role in roles)} "
+            "já reagiram em pelo menos uma hora."
+        )
+    else:
+        mentions = [m.mention for m in non_voters]
+        chunks = chunk_mentions(mentions)
+
+        for i, chunk in enumerate(chunks[:8]):
+            name = f"Faltam votar ({len(non_voters)})" if i == 0 else "Faltam votar (cont.)"
+            embed.add_field(name=name, value=chunk, inline=False)
+
+        if len(chunks) > 8:
+            embed.set_footer(text=f"+ {len(non_voters)} membros no total • {now.strftime('%H:%M')}")
+        else:
+            embed.set_footer(text=f"{len(non_voters)} membro(s) • {now.strftime('%H:%M')}")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # ── /auto ────────────────────────────────────────
@@ -1080,6 +1673,11 @@ async def slash_ajuda(interaction: discord.Interaction):
         inline=False,
     )
     embed.add_field(
+        name="</remove>",
+        value="Remove um membro da participação depois de fechada.\n`membro` `atividade` *(opcional)*",
+        inline=False,
+    )
+    embed.add_field(
         name="</ranking>",
         value="Ranking de quem mais participou no mês.\n`mes` `ano` *(opcional)*",
         inline=False,
@@ -1097,6 +1695,11 @@ async def slash_ajuda(interaction: discord.Interaction):
     embed.add_field(
         name="</resumo>",
         value="Mostra quem reagiu em cada hora.",
+        inline=False,
+    )
+    embed.add_field(
+        name="</pendentes>",
+        value="Membros da org que ainda não votaram.\n`cargo` *(opcional — senão usa PENDENTES_CARGOS)*",
         inline=False,
     )
     embed.add_field(
@@ -1174,6 +1777,82 @@ async def scheduled_config_backup():
     create_timestamped_backup(force=True)
 
 
+@tasks.loop(minutes=1)
+async def check_weekly_ranking():
+    cfg = load_config()
+    weekly_ranking = cfg.get("weekly_ranking", {})
+    
+    if not weekly_ranking:
+        return
+    
+    tz = pytz.timezone(TIMEZONE)
+    now = datetime.now(tz)
+    
+    # Check if it's the right day and hour (minute 0)
+    if now.minute != 0:
+        return
+    
+    current_week = now.isocalendar()[1]
+    current_year = now.year
+    current_day = now.weekday()  # 0 = Monday, 6 = Sunday
+    
+    for channel_key, config in weekly_ranking.items():
+        if not config.get("enabled"):
+            continue
+        
+        if config.get("day_of_week") != current_day:
+            continue
+        
+        if config.get("hour") != now.hour:
+            continue
+        
+        # Check if we already sent the ranking for this week
+        last_sent = config.get("last_sent_week")
+        if last_sent == current_week:
+            continue
+        
+        try:
+            channel = bot.get_channel(config["channel_id"])
+            if not channel:
+                continue
+            
+            guild_id = config["guild_id"]
+            history = get_guild_participation_history(cfg, guild_id)
+            week_history = filter_history_by_week(history, current_year, current_week)
+            counts = count_participations_by_member(week_history)
+            
+            if not counts:
+                await channel.send(
+                    embed=discord.Embed(
+                        description=f"ℹ️ Sem participações registadas na semana {current_week} de {current_year}.",
+                        color=COLOR_YELLOW,
+                    )
+                )
+            else:
+                ranking = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+                medals = ["🥇", "🥈", "🥉"]
+                lines = []
+                for i, (uid, count) in enumerate(ranking[:15]):
+                    prefix = medals[i] if i < 3 else f"**{i + 1}.**"
+                    lines.append(f"{prefix} <@{uid}> — **{count}** participações")
+                
+                embed = discord.Embed(
+                    title=f"🏆 Ranking Semanal — Semana {current_week}",
+                    description="\n".join(lines),
+                    color=COLOR_BLUE,
+                    timestamp=now,
+                )
+                embed.set_footer(text=f"{len(week_history)} atividades registadas nesta semana")
+                await channel.send(embed=embed)
+            
+            # Mark as sent for this week
+            cfg["weekly_ranking"][channel_key]["last_sent_week"] = current_week
+            save_config(cfg)
+            
+        except Exception as e:
+            print(f"Erro ao enviar ranking semanal para canal {channel_key}: {e}")
+
+
 # ═══════════════════════════════════════════════
 #  EVENTOS
 # ═══════════════════════════════════════════════
@@ -1207,9 +1886,12 @@ async def on_ready():
     check_auto_schedule.start()
     if not scheduled_config_backup.is_running():
         scheduled_config_backup.start()
+    if not check_weekly_ranking.is_running():
+        check_weekly_ranking.start()
     print(f"[OK] Bot online: {bot.user} (ID: {bot.user.id})")
     print(f"[TZ] Fuso horario: {TIMEZONE}")
     print(f"[SCH] Agendamento: {'Ativo' if bot._auto_schedule else 'Inativo'}")
+    print(f"[RANK] Ranking semanal: {'Ativo' if cfg.get('weekly_ranking') else 'Inativo'}")
     print("-" * 40)
 
 
