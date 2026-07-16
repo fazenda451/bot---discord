@@ -10,7 +10,7 @@ Bot para gerir horários e participações num servidor Discord, com reações a
 - Edita horários já publicados (adicionar ou remover horas)
 - Resumo de quem reagiu em cada hora
 - Verificação de presença por atividade com fecho automático
-- Adicionar membros à lista depois da participação fechar
+- Adicionar ou remover membros da lista depois da participação fechar
 - Ranking mensal de participações e consulta de presença por membro
 - Backup automático do `schedule_config.json` com restauração ao reiniciar
 - Agendamento automático diário do horário
@@ -47,6 +47,7 @@ TIMEZONE=Europe/Lisbon
 3. Copia o **Token** e cola no `.env`
 4. Em **Bot → Privileged Gateway Intents**, ativa:
    - ✅ Message Content Intent
+   - ✅ Server Members Intent *(necessário para `/pendentes`)*
 5. Convida o bot com as permissões: `Send Messages`, `Add Reactions`, `Manage Messages`, `Read Message History`
 
 ### 4. Iniciar o bot
@@ -94,10 +95,12 @@ O bot guarda cópias do `schedule_config.json` para evitar perda de dados:
 | `/horario` | Posta o horário do dia com reações por hora | Gerir Mensagens |
 | `/participacao` | Inicia verificação de presença (padrão: 15 min) | **Todos** |
 | `/add` | Adiciona membro à participação depois de fechada | Gerir Mensagens |
+| `/remove` | Remove membro da participação depois de fechada | Gerir Mensagens |
 | `/ranking` | Ranking de quem mais participou no mês | Todos |
 | `/presenca` | Quantas vezes um membro participou num mês | Gerir Mensagens |
 | `/editar` | Adiciona ou remove horas de um horário existente | Gerir Mensagens |
 | `/resumo` | Mostra quem reagiu em cada hora | Gerir Mensagens |
+| `/pendentes` | Quem da org ainda não votou (`cargo` opcional ou `PENDENTES_CARGOS`) | Gerir Mensagens |
 | `/auto` | Configura envio automático diário do horário | Administrador |
 | `/parar` | Para o agendamento automático | Administrador |
 | `/status` | Mostra o estado do agendamento automático | Gerir Mensagens |
@@ -110,9 +113,11 @@ O bot guarda cópias do `schedule_config.json` para evitar perda de dados:
 /horario atividade:FARMAR LIXO hora_inicio:16 hora_fim:20
 /participacao atividade:Raid tempo:10
 /add membro:@João atividade:Raid
+/remove membro:@João atividade:Raid
 /ranking mes:3 ano:2026
 /presenca membro:@João mes:3
 /editar adicionar:21 22 remover:16
+/pendentes
 /auto hora_inicio:14 hora_fim:23 hora_post:13 cargo:@Membros
 ```
 
@@ -125,7 +130,7 @@ O bot guarda cópias do `schedule_config.json` para evitar perda de dados:
 3. Os membros reagem para confirmar presença
 4. Após o tempo definido (padrão 15 min), a participação fecha automaticamente
 5. É publicado um resumo com a lista de participantes
-6. Se alguém chegar tarde, usa `/add membro:@Utilizador` para atualizar a lista
+6. Se alguém chegar tarde, usa `/add membro:@Utilizador` para atualizar a lista; `/remove` para tirar alguém
 
 ---
 
