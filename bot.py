@@ -11,8 +11,27 @@ import unicodedata
 from datetime import datetime, timedelta
 import pytz
 from dotenv import load_dotenv
+from flask import Flask
+from threading import Thread
 
 load_dotenv()
+
+# ── KEEP ALIVE SERVER ──
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot está online e ativo 24/7!"
+
+def run_web_server():
+    # O Glitch usa a porta 3000 por padrão
+    port = int(os.environ.get('PORT', 3000))
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = Thread(target=run_web_server)
+    t.start()
+
 
 # ═══════════════════════════════════════════════
 #  CONFIGURAÇÃO
@@ -1912,4 +1931,5 @@ if __name__ == "__main__":
     if not TOKEN:
         print("[ERR] DISCORD_TOKEN nao encontrado no .env!")
         exit(1)
+    keep_alive()  # Inicia o servidor Flask web em background
     bot.run(TOKEN)
